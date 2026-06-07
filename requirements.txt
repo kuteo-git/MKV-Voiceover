@@ -1,0 +1,12 @@
+# Python dependencies for the Vietnamese voiceover toolkit (Python >= 3.9).
+# Install with:  python -m pip install -r requirements.txt
+#
+# System tools are NOT installable here and must be present on PATH:
+#   ffmpeg + ffprobe   (audio/video processing; pydub also needs ffmpeg)
+#   eSpeak NG          (phonemizer required by VieNeu-TTS)
+#     macOS:           brew install ffmpeg espeak
+#     Ubuntu/Debian:   sudo apt install ffmpeg espeak-ng
+
+vieneu      # VieNeu-TTS Vietnamese text-to-speech engine
+srt         # SRT subtitle parsing
+pydub       # audio assembly / export (requires ffmpeg)
