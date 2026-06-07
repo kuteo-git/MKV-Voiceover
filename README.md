@@ -15,6 +15,10 @@ Two scripts:
 `mkv_voiceover.py` reuses the core of `srt_to_voiceover.py`, so **keep both files in
 the same folder.**
 
+Demo:
+
+https://github.com/user-attachments/assets/e1f77403-139a-4762-9676-e8de132eed0f
+
 ---
 
 ## 1. Requirements
