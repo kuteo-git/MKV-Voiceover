@@ -15,10 +15,6 @@ Two scripts:
 `mkv_voiceover.py` reuses the core of `srt_to_voiceover.py`, so **keep both files in
 the same folder.**
 
-Demo:
-
-https://github.com/user-attachments/assets/e1f77403-139a-4762-9676-e8de132eed0f
-
 ---
 
 ## 1. Requirements
@@ -280,6 +276,15 @@ even if output exists). Files ending in `_thuyetminh`/`.ttstmp` are always skipp
   so you can change `--speed` and re-run without re-synthesizing.
 - **An all-caps line is spelled out letter by letter** — fixed: a cue whose letters are all
   uppercase (ignoring digits/symbols) is lowercased before synthesis so it's read as words.
+- **`ValueError: No valid speech tokens found in the output`** — VieNeu couldn't vocalize
+  a particular cue (often a line that is only punctuation/symbols, or an odd number-only
+  string). Such cues are now skipped automatically (the slot stays silent) and a
+  `skipped cue #N` warning is printed; one bad cue no longer aborts the file, and `batch`
+  keeps going to the next file regardless of the error.
+- **Subtitle formatting tags** — `<i>…</i>`, `<b>`, `<font …>`, ASS override blocks like
+  `{\an8}`/`{\i1}`, ASS line breaks (`\N`) and HTML entities (`&amp;`, `&#39;`) are all
+  stripped/decoded before synthesis, so e.g. `đây là <i>chữ nghiêng</i>` reads as
+  `đây là chữ nghiêng`.
 - **Numbers/symbols** — `%`, `°C`, `°F`, `km/h`, `kg`, `km`, `&`, `+`, `=`, `~` are
   expanded to Vietnamese words; `:` `/` `-` are kept so times/dates/ranges survive.
   Extend the `_EXPAND` map in `srt_to_voiceover.py` for anything else. Tricky large
