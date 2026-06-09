@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import html
 import os
 import re
 import subprocess
@@ -88,6 +89,10 @@ def normalize_text(text: str) -> str:
     to words first, strips emoji/markup, and collapses whitespace and repeats.
     """
     text = unicodedata.normalize("NFC", text)
+    text = html.unescape(text)                        # &amp; -> &, &#39; -> ' etc.
+    text = re.sub(r"<[^>]+>", " ", text)              # HTML/SRT tags: <i>, </i>, <font ...>
+    text = re.sub(r"\{[^}]*\}", " ", text)            # ASS/SSA override blocks: {\an8}, {\i1}
+    text = re.sub(r"\\[Nnh]", " ", text)              # ASS line breaks / hard spaces: \N \n \h
     text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
     # Decide ALL-CAPS on the ORIGINAL letters, before expansion injects lowercase
     # words (e.g. '%' -> 'phần trăm'); VieNeu would otherwise spell all-caps out.
@@ -346,7 +351,7 @@ def merge_cues(cues: List[Cue], gap_ms: int) -> List[Cue]:
     for cue in cues[1:]:
         prev = merged[-1]
         if cue.start_ms - prev.end_ms <= gap_ms:
-            joiner = "" if prev.text.endswith((".", ",", "!", "?")) else ","
+            joiner = "" if prev.text.endswith((".", ",", "!", "?")) else "."
             merged[-1] = Cue(
                 index=prev.index,
                 start_ms=prev.start_ms,
@@ -400,11 +405,17 @@ def render_narration(
     placements: List[tuple[int, AudioSegment]] = []
     total = len(cues)
     start_t = time.monotonic()
-    n_synth = n_cache = 0
+    n_synth = n_cache = n_skip = 0
 
     for i, cue in enumerate(cues):
         next_start = cues[i + 1].start_ms if i + 1 < total else cue.end_ms
         slot_ms = max(next_start - cue.start_ms, cue.end_ms - cue.start_ms)
+
+        # Skip cues with nothing speakable (only punctuation/symbols); the TTS
+        # model raises "No valid speech tokens" on these. The slot stays silent.
+        if not any(ch.isalnum() for ch in cue.text):
+            n_skip += 1
+            continue
 
         raw_path = work_dir / f"cue_{cue.index}.wav"
         cached = cache_dir / f"{synth.cache_key(cue.text)}.wav" if cache_dir else None
@@ -412,7 +423,13 @@ def render_narration(
             clip = AudioSegment.from_wav(cached)
             n_cache += 1
         else:
-            clip = synth.synth(cue.text, raw_path)
+            try:
+                clip = synth.synth(cue.text, raw_path)
+            except Exception as e:  # one bad cue must not abort the whole file/batch
+                n_skip += 1
+                sys.stdout.write(f"\n  warn: skipped cue #{cue.index}: {e}\n")
+                sys.stdout.flush()
+                continue
             if cached:
                 clip.export(cached, format="wav")
             n_synth += 1
@@ -426,15 +443,18 @@ def render_narration(
             done = i + 1
             elapsed = time.monotonic() - start_t
             eta = (elapsed / done) * (total - done)
+            skip_note = f" / skip {n_skip}" if n_skip else ""
             sys.stdout.write(
                 f"\r  {done}/{total} ({100 * done / total:4.1f}%)  "
-                f"synth {n_synth} / cache {n_cache}  "
+                f"synth {n_synth} / cache {n_cache}{skip_note}  "
                 f"elapsed {_fmt_secs(elapsed)}  eta {_fmt_secs(eta)}   "
             )
             sys.stdout.flush()
 
     if show_progress:
         sys.stdout.write("\n")
+        if n_skip:
+            sys.stdout.write(f"  ({n_skip} cue(s) skipped)\n")
         sys.stdout.flush()
 
     return assemble_track(placements, floor_ms=floor_ms)

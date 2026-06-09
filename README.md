@@ -15,10 +15,6 @@ Two scripts:
 `mkv_voiceover.py` reuses the core of `srt_to_voiceover.py`, so **keep both files in
 the same folder.**
 
-Demo:
-
-https://github.com/user-attachments/assets/e1f77403-139a-4762-9676-e8de132eed0f
-
 ---
 
 ## 1. Requirements
@@ -98,7 +94,7 @@ python srt_to_voiceover.py phim.srt --video phim.mp4 --voice Doan --audio-out na
 
 # C) MKV with embedded Vietnamese sub -> add a "Thuyết minh" track
 python mkv_voiceover.py single 'movie.mkv' --voice Doan --emotion storytelling \
-    --duck-mode auto --merge-gap 350 --cache-dir .ttscache
+    --duck-mode auto --merge-gap 34 --cache-dir .ttscache
 
 # Real example (anime: no English track, so mix over the Japanese audio).
 # First run WITHOUT --in-place to verify, then add --in-place to overwrite.
@@ -106,13 +102,13 @@ python mkv_voiceover.py single \
     '/Volumes/Data/Plex/tvshow/Attack on Titan (2013)/Season 01/Attack.on.Titan.S01E06.mkv' \
     --voice Doan --emotion storytelling \
     --audio-lang jpn --duck-mode auto \
-    --merge-gap 350 --cache-dir .ttscache
+    --merge-gap 34 --cache-dir .ttscache
 
 # Whole season, overwriting in place once you're happy with the result
 python mkv_voiceover.py batch \
     '/Volumes/Data/Plex/tvshow/Attack on Titan (2013)/Season 01' \
     --voice Doan --emotion storytelling --audio-lang jpn \
-    --merge-gap 350 --cache-dir .ttscache --in-place
+    --merge-gap 34 --cache-dir .ttscache --in-place
 ```
 
 ---
@@ -173,7 +169,7 @@ python mkv_voiceover.py single movie.mkv --duck-mode static --duck-db -6
   file (e.g. after an interrupt, or when tweaking mix/balance without re-synthesizing);
   different episodes share little. One-shot clean run: `--cache-dir auto --clean-cache`.
 - `--merge-gap MS` merges cues separated by small gaps to cut the number of TTS calls
-  (also reads more naturally). Try `--merge-gap 350`.
+  (also reads more naturally). Try `--merge-gap 34`.
 - `--analyze-seconds N` limits how much film audio is scanned for loudness (default 300).
 - Progress is logged as six numbered stages, each with a `done (Xs)` marker, plus a live
   `done/total` line with ETA during synthesis and a final `DONE <path> (Xs total)`. Noisy
@@ -280,6 +276,15 @@ even if output exists). Files ending in `_thuyetminh`/`.ttstmp` are always skipp
   so you can change `--speed` and re-run without re-synthesizing.
 - **An all-caps line is spelled out letter by letter** — fixed: a cue whose letters are all
   uppercase (ignoring digits/symbols) is lowercased before synthesis so it's read as words.
+- **`ValueError: No valid speech tokens found in the output`** — VieNeu couldn't vocalize
+  a particular cue (often a line that is only punctuation/symbols, or an odd number-only
+  string). Such cues are now skipped automatically (the slot stays silent) and a
+  `skipped cue #N` warning is printed; one bad cue no longer aborts the file, and `batch`
+  keeps going to the next file regardless of the error.
+- **Subtitle formatting tags** — `<i>…</i>`, `<b>`, `<font …>`, ASS override blocks like
+  `{\an8}`/`{\i1}`, ASS line breaks (`\N`) and HTML entities (`&amp;`, `&#39;`) are all
+  stripped/decoded before synthesis, so e.g. `đây là <i>chữ nghiêng</i>` reads as
+  `đây là chữ nghiêng`.
 - **Numbers/symbols** — `%`, `°C`, `°F`, `km/h`, `kg`, `km`, `&`, `+`, `=`, `~` are
   expanded to Vietnamese words; `:` `/` `-` are kept so times/dates/ranges survive.
   Extend the `_EXPAND` map in `srt_to_voiceover.py` for anything else. Tricky large
@@ -300,7 +305,7 @@ python -m pip install -r requirements.txt   # or: python -m pip install vieneu s
 python mkv_voiceover.py single "<INPUT>.mkv" \
     --voice Doan --emotion storytelling \
     --sub-lang vie --audio-lang eng \
-    --merge-gap 350 --cache-dir .ttscache
+    --merge-gap 34 --cache-dir .ttscache
 
 # 3. Whole folder, overwriting originals in place
 python mkv_voiceover.py batch "<FOLDER>" --recursive \

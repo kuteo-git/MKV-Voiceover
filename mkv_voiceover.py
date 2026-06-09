@@ -583,8 +583,13 @@ def run_batch(args: argparse.Namespace) -> None:
         except subprocess.CalledProcessError as e:
             print(f"  FAILED: ffmpeg error ({e.returncode})")
             failed.append(mkv.name)
-        except SystemExit as e:  # one file's fatal issue shouldn't kill the batch
+        except KeyboardInterrupt:
+            raise
+        except SystemExit as e:  # process_file uses sys.exit for fatal per-file issues
             print(f"  FAILED: {e}")
+            failed.append(mkv.name)
+        except Exception as e:  # any other per-file error: log and keep going
+            print(f"  FAILED: {type(e).__name__}: {e}")
             failed.append(mkv.name)
         print()
 
