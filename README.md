@@ -17,6 +17,12 @@ the same folder.**
 
 ---
 
+Demo:
+
+https://github.com/user-attachments/assets/e1f77403-139a-4762-9676-e8de132eed0f
+
+---
+
 ## 1. Requirements
 
 **Python:** 3.9 or newer (uses `argparse.BooleanOptionalAction`).
