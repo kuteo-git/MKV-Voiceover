@@ -10,3 +10,4 @@
 vieneu      # VieNeu-TTS Vietnamese text-to-speech engine
 srt         # SRT subtitle parsing
 pydub       # audio assembly / export (requires ffmpeg)
+numpy       # fast timeline assembly (summing clips into one buffer)

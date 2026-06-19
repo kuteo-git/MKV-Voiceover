@@ -30,7 +30,7 @@ https://github.com/user-attachments/assets/e1f77403-139a-4762-9676-e8de132eed0f
 **Python packages** — install all three (or `python -m pip install -r requirements.txt`):
 
 ```bash
-python -m pip install vieneu srt pydub
+python -m pip install vieneu srt pydub numpy
 ```
 
 | Package | Used for |
@@ -38,10 +38,11 @@ python -m pip install vieneu srt pydub
 | `vieneu` | VieNeu-TTS Vietnamese text-to-speech engine (loaded lazily on first synth) |
 | `srt` | Parsing `.srt` subtitle files |
 | `pydub` | Assembling/exporting the narration audio (calls ffmpeg under the hood) |
+| `numpy` | Fast timeline assembly (sums all clips into one buffer) |
 
 Everything else the scripts use is in the Python standard library (`argparse`,
 `subprocess`, `pathlib`, `json`, `re`, `unicodedata`, `hashlib`, `shutil`, `contextlib`,
-`tempfile`, `time`, `os`, `sys`, `dataclasses`, `typing`).
+`tempfile`, `time`, `os`, `sys`, `dataclasses`, `typing`, `concurrent.futures`).
 
 **System tools** (NOT installable via pip — must be on PATH):
 
@@ -58,11 +59,11 @@ sudo apt install ffmpeg espeak-ng
 
 **Notes**
 
-- VieNeu's default backbone is `VieNeu-TTS-0.3B-q4-gguf` — CPU-optimized and
-  near real-time, no GPU needed (works well on Apple Silicon).
-- Output audio is 24 kHz and **watermarked by default**.
-- **Licensing:** the 0.5B model is Apache-2.0 (commercial OK); the default 0.3B
-  model is non-commercial — contact the author for commercial use.
+- VieNeu's default backbone is **VieNeu-TTS v3 Turbo** — on CPU it runs torch-free
+  via ONNX Runtime (no GPU needed, works well on Apple Silicon); on a CUDA GPU it
+  uses PyTorch.
+- Output audio is **48 kHz** and **watermarked by default**.
+- **Licensing:** VieNeu-TTS v3 Turbo is Apache-2.0 (commercial OK).
 - First run downloads the model from Hugging Face (one-time).
 
 ---
@@ -71,17 +72,21 @@ sudo apt install ffmpeg espeak-ng
 
 ### Preset voices
 
-Pass one of these IDs to `--voice`:
+Pass one of these names to `--voice`. **Names contain spaces, so quote them**
+(e.g. `--voice "Ngọc Lan"`):
 
-| ID | Name | Gender | Region |
-| --- | --- | --- | --- |
-| `Binh` | Thanh Bình | Male | Northern |
-| `Tuyen` | Phạm Tuyên | Male | Northern |
-| `Vinh` | Xuân Vĩnh | Male | Southern |
-| `Doan` | Thục Đoan | Female | Southern |
-| `Ly` | Trúc Ly | Female | Northern |
-| `Sơn` | Thái Sơn | Male | Southern |
-| `Ngoc` | Bích Ngọc | Female | Northern |
+| `--voice` | Gender | Style |
+| --- | --- | --- |
+| `Ngọc Linh` | Female | tươi sáng (**default**) |
+| `Ngọc Lan` | Female | dịu dàng |
+| `Mỹ Duyên` | Female | mượt mà |
+| `Trúc Ly` | Female | trẻ trung |
+| `Gia Bảo` | Male | mượt mà |
+| `Thái Sơn` | Male | chắc khỏe |
+| `Đức Trí` | Male | rõ ràng |
+| `Xuân Vĩnh` | Male | vui tươi |
+| `Trọng Hữu` | Male | uyên bác |
+| `Bình An` | Male | điềm đạm |
 
 You can also list them at runtime (in case the set changes):
 
@@ -93,28 +98,29 @@ python -c "from vieneu import Vieneu; [print(n,'-',d) for d,n in Vieneu().list_p
 
 ```bash
 # A) SRT -> narration audio only
-python srt_to_voiceover.py phim.srt --audio-out thuyetminh.mp3 --voice Doan
+python srt_to_voiceover.py phim.srt --audio-out thuyetminh.mp3 --voice "Ngọc Lan"
 
 # B) SRT + video -> narration mixed into the video
-python srt_to_voiceover.py phim.srt --video phim.mp4 --voice Doan --audio-out narration.wav
+python srt_to_voiceover.py phim.srt --video phim.mp4 --voice "Ngọc Lan" --audio-out narration.wav
 
 # C) MKV with embedded Vietnamese sub -> add a "Thuyết minh" track
-python mkv_voiceover.py single 'movie.mkv' --voice Doan --emotion storytelling \
+python mkv_voiceover.py single 'movie.mkv' --voice "Ngọc Lan" --emotion storytelling \
     --duck-mode auto --merge-gap 34 --cache-dir .ttscache
 
 # Real example (anime: no English track, so mix over the Japanese audio).
 # First run WITHOUT --in-place to verify, then add --in-place to overwrite.
 python mkv_voiceover.py single \
     '/Volumes/Data/Plex/tvshow/Attack on Titan (2013)/Season 01/Attack.on.Titan.S01E06.mkv' \
-    --voice Doan --emotion storytelling \
+    --voice "Ngọc Lan" --emotion storytelling \
     --audio-lang jpn --duck-mode auto \
     --merge-gap 34 --cache-dir .ttscache
 
-# Whole season, overwriting in place once you're happy with the result
+# Whole season, overwriting in place once you're happy with the result.
+# --workers 2 synthesizes cues in parallel (~1.8x faster); needs --cache-dir.
 python mkv_voiceover.py batch \
     '/Volumes/Data/Plex/tvshow/Attack on Titan (2013)/Season 01' \
-    --voice Doan --emotion storytelling --audio-lang jpn \
-    --merge-gap 34 --cache-dir .ttscache --in-place
+    --voice "Ngọc Lan" --emotion storytelling --audio-lang jpn \
+    --merge-gap 34 --cache-dir .ttscache --in-place --workers 2
 ```
 
 ---
@@ -167,6 +173,12 @@ python mkv_voiceover.py single movie.mkv --duck-mode static --duck-db -6
 ## 5. Performance
 
 - The TTS step is the only heavy part; muxing is a near-instant stream copy.
+- `--workers N` synthesizes cues in parallel across `N` processes (each cue is an
+  independent TTS call), so it speeds up even a **single** file. Requires `--cache-dir`
+  (workers hand results back through the cache). Measured ~1.8x at `--workers 2` on a
+  10-core machine; each worker loads its own model (~1–2 GB RAM), and the threads per
+  worker are auto-capped so they don't oversubscribe the CPU. Diminishing returns past
+  the point where workers × model-RAM exhausts memory or all cores are busy.
 - `--cache-dir DIR` memoizes each cue, so re-runs / retries skip already-rendered cues.
   It is **not** auto-deleted (that's what makes retries fast) and is created wherever you
   run the command. Use `--cache-dir auto` to place it next to each MKV
@@ -178,12 +190,15 @@ python mkv_voiceover.py single movie.mkv --duck-mode static --duck-db -6
   (also reads more naturally). Try `--merge-gap 34`.
 - `--analyze-seconds N` limits how much film audio is scanned for loudness (default 300).
 - Progress is logged as six numbered stages, each with a `done (Xs)` marker, plus a live
-  `done/total` line with ETA during synthesis and a final `DONE <path> (Xs total)`. Noisy
-  ffmpeg / llama.cpp-Metal init logs are suppressed (pass `--verbose` to see them).
+  `done/total` line with ETA during synthesis and a final `DONE <path> (Xs total)`. With
+  `--workers`, the parallel pre-synthesis shows a slider with elapsed/ETA that advances
+  per cue (`prefill [███░░░] 740/1818 (40.7%) elapsed 2:10 eta 3:09`); the ETA settles
+  after the models finish loading. Noisy ffmpeg / backend init logs are suppressed (pass
+  `--verbose` to see them).
 - **Tip:** test on a 60-second clip first.
   ```bash
   ffmpeg -i movie.mkv -t 60 -c copy -map 0 test60.mkv
-  python mkv_voiceover.py single test60.mkv --voice Doan --cache-dir .ttscache
+  python mkv_voiceover.py single test60.mkv --voice "Ngọc Lan" --cache-dir .ttscache
   ```
 
 ---
@@ -199,13 +214,14 @@ python mkv_voiceover.py single movie.mkv --duck-mode static --duck-db -6
 | `--video-out PATH` | auto | Output video path |
 | `--replace-audio` | off | Replace original audio instead of mixing over it |
 | `--duck-db N` | `-12` | Original-audio level when mixing |
-| `--voice ID` | – | Preset voice id (e.g. `Doan`, `Vinh`) |
+| `--voice ID` | – | Preset voice name, quote if it has spaces (e.g. `"Ngọc Lan"`) |
 | `--emotion` | `natural` | `natural` or `storytelling` |
 | `--clone-audio` / `--clone-text` | – | Clone a narrator voice from a 3–5 s clip |
 | `--max-speed N` | `1.5` | Max pitch-preserving speed-up to fit a slot |
 | `--speed N` | `1.0` | Global pitch-preserving narration speed (1.1–1.25 transparent) |
 | `--merge-gap MS` | `0` | Merge cues with gaps ≤ this |
 | `--cache-dir DIR` | – | Per-cue synthesis cache |
+| `--workers N` | `1` | Parallel TTS worker processes (needs `--cache-dir`) |
 
 ### `mkv_voiceover.py single MKV [options]` / `batch FOLDER [options]`
 
@@ -213,7 +229,7 @@ Common options:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--voice ID` | – | Preset voice id |
+| `--voice ID` | – | Preset voice name, quote if it has spaces (e.g. `"Ngọc Lan"`) |
 | `--emotion` | `natural` | `natural` or `storytelling` |
 | `--clone-audio` / `--clone-text` | – | Voice cloning |
 | `--sub-lang` | `vie` | Subtitle language tag to match |
@@ -233,6 +249,7 @@ Common options:
 | `--merge-gap MS` | `0` | Merge close cues |
 | `--cache-dir DIR` | – | Per-cue synthesis cache (`auto` = next to each MKV) |
 | `--clean-cache` | off | Delete the cache dir after finishing |
+| `--workers N` | `1` | Parallel TTS workers per file, ~1.8x at `2` (needs `--cache-dir`; ~1–2 GB RAM each) |
 | `--audio-codec` | `libopus` | Codec for the new track |
 | `--bitrate` | `128k` | Bitrate for the new track |
 | `--track-title` | `Thuyết minh (TTS)` | Track title metadata |
@@ -309,13 +326,13 @@ python -m pip install -r requirements.txt   # or: python -m pip install vieneu s
 
 # 2. Single file -> writes movie_thuyetminh.mkv
 python mkv_voiceover.py single "<INPUT>.mkv" \
-    --voice Doan --emotion storytelling \
+    --voice "Ngọc Lan" --emotion storytelling \
     --sub-lang vie --audio-lang eng \
-    --merge-gap 34 --cache-dir .ttscache
+    --merge-gap 34 --cache-dir .ttscache --workers 2
 
 # 3. Whole folder, overwriting originals in place
 python mkv_voiceover.py batch "<FOLDER>" --recursive \
-    --voice Doan --cache-dir .ttscache --in-place
+    --voice "Ngọc Lan" --cache-dir .ttscache --in-place --workers 2
 
 # 4. Inspect the result
 ffprobe -v error -show_streams -select_streams a "<INPUT>_thuyetminh.mkv"

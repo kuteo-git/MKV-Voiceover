@@ -6,7 +6,7 @@ subtitle into a VieNeu-TTS voiceover, and add it back into the .mkv as an extra
 audio track. The original video/audio/subtitles are kept untouched (stream copy),
 so a player can simply switch the audio channel to the "Thuyết minh" track.
 
-    python mkv_voiceover.py movie.mkv --voice Doan --emotion storytelling \
+    python mkv_voiceover.py movie.mkv --voice "Trọng Hữu" --emotion storytelling \
         --merge-gap 350 --cache-dir .ttscache
 
 Pipeline:  probe MKV -> pick Vietnamese sub -> extract to .srt
@@ -16,10 +16,11 @@ Pipeline:  probe MKV -> pick Vietnamese sub -> extract to .srt
 Performance notes
 -----------------
   * The TTS step is the only heavy part; muxing is a near-instant stream copy.
-  * VieNeu's default backbone (0.3B-q4 GGUF) already runs near real-time on CPU
-    and uses all cores per inference, so this script optimizes by doing LESS work:
+  * VieNeu-TTS v3 Turbo runs torch-free via ONNX on CPU (PyTorch on GPU). This
+    script optimizes by doing LESS / more-parallel work:
       - per-cue caching (--cache-dir) makes re-runs/retries free,
-      - cue merging (--merge-gap) reduces the number of model calls.
+      - cue merging (--merge-gap) reduces the number of model calls,
+      - parallel synthesis (--workers) spreads cues across processes.
   * Only the new narration track is encoded (Opus); everything else is copied.
 
 Requires: ffmpeg + ffprobe on PATH, plus the part-1 deps (vieneu, srt, pydub)
@@ -46,6 +47,7 @@ from srt_to_voiceover import (  # core reused from part 1
     Synthesizer,
     merge_cues,
     parse_srt,
+    prefill_cache_parallel,
     probe_duration_ms,
     render_narration,
 )
@@ -486,6 +488,8 @@ def process_file(mkv: Path, args: argparse.Namespace, *,
         )
 
         with _stage(3, total, "Synthesize narration"):
+            if cache_dir and args.workers > 1:
+                prefill_cache_parallel(cues, synth, cache_dir=cache_dir, workers=args.workers)
             track = render_narration(
                 cues, synth,
                 max_speed=args.max_speed,
@@ -612,7 +616,7 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
                         "(default eng); Vietnamese tracks are always excluded as the base")
     p.add_argument("--audio-index", type=int, help="Force audio-relative index (0:a:N) for the mix base")
     # voice
-    p.add_argument("--voice", help="Preset voice id, e.g. 'Doan' or 'Vinh'")
+    p.add_argument("--voice", help="Preset voice id, e.g. 'Ngọc Linh' or 'Trọng Hữu'")
     p.add_argument("--emotion", default="natural", help="'natural' or 'storytelling'")
     p.add_argument("--clone-audio", help="3-5s reference .wav to clone narrator voice")
     p.add_argument("--clone-text", help="Exact transcript of the reference clip")
@@ -627,6 +631,10 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
                         "it next to each MKV (<folder>/.ttscache)")
     p.add_argument("--clean-cache", action="store_true",
                    help="Delete the cache dir after finishing (end of batch)")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Parallel TTS worker processes to pre-synthesize cues within "
+                        "each file (needs --cache-dir; default 1). Speeds up a single "
+                        "long file; each worker loads its own model (~1-2 GB RAM).")
     # loudness / balance
     p.add_argument("--auto-balance", action=argparse.BooleanOptionalAction, default=True,
                    help="Measure film+narration loudness and auto-set voice gain (default on)")
@@ -674,6 +682,8 @@ def main() -> None:
     _add_common_args(sp_batch)
 
     args = parser.parse_args()
+    if args.workers > 1 and not args.cache_dir:
+        sys.exit("--workers > 1 requires --cache-dir (workers share results via the cache).")
     if args.command == "batch":
         run_batch(args)
     else:

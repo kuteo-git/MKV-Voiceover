@@ -24,8 +24,8 @@ Notes / caveats
     sync is enforced here by time-stretching each clip with ffmpeg `atempo`
     (pitch-preserving). Stretch is capped (--max-speed); beyond the cap the clip
     is allowed to overflow into the following gap instead of sounding sped-up.
-  * VieNeu output is 24 kHz, watermarked by default.
-  * Model licensing: 0.5B = Apache-2.0 (commercial OK); 0.3B = CC BY-NC.
+  * VieNeu v3 Turbo output is 48 kHz, watermarked by default.
+  * Model licensing: VieNeu-TTS v3 Turbo = Apache-2.0 (commercial OK).
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from typing import List, Optional
 import srt  # type: ignore
 from pydub import AudioSegment  # type: ignore
 
-VIENEU_SAMPLE_RATE = 24_000
+VIENEU_SAMPLE_RATE = 48_000  # VieNeu-TTS v3 Turbo outputs 48 kHz
 
 
 # --------------------------------------------------------------------------- #
@@ -140,7 +140,7 @@ def parse_srt(path: Path) -> List[Cue]:
 # --------------------------------------------------------------------------- #
 @contextlib.contextmanager
 def _suppress_native_stderr(enabled: bool = True):
-    """Temporarily silence C-level stderr (fd 2), e.g. llama.cpp / Metal init spam.
+    """Temporarily silence C-level stderr (fd 2), e.g. ONNX Runtime / Metal init spam.
 
     Python-level exceptions still propagate; only the noisy native logging is hidden.
     """
@@ -164,10 +164,10 @@ class Synthesizer:
 
     Lazily initialized so that --help and SRT validation don't pay the model
     load cost. Voice selection precedence:
-        1. preset voice id  (e.g. 'Doan', 'Vinh') via get_preset_voice()
+        1. preset voice id  (e.g. 'Ngọc Linh', 'Trọng Hữu') via get_preset_voice()
         2. cloned voice from a 3-5s reference clip
         3. model default
-    `emotion` ('natural' | 'storytelling') is set once at engine init.
+    `emotion` ('natural' | 'storytelling') is applied per inference (v3 Turbo).
     `quiet` hides the backend's native init logging.
     """
 
@@ -196,7 +196,9 @@ class Synthesizer:
             from vieneu import Vieneu  # imported here to keep startup light
 
             with _suppress_native_stderr(self._quiet):
-                self._tts = Vieneu(emotion=self._emotion)
+                # v3 Turbo is the default mode; emotion is now passed per-inference
+                # (see synth()), not at engine construction time.
+                self._tts = Vieneu(mode="v3turbo")
                 if self._voice_id:
                     self._voice_data = self._tts.get_preset_voice(self._voice_id)
         return self._tts
@@ -210,16 +212,32 @@ class Synthesizer:
         sig = f"{self._emotion}|{self._voice_id}|{self._ref_audio}|{self._ref_text}|{text}"
         return hashlib.sha1(sig.encode("utf-8")).hexdigest()
 
+    def config(self) -> dict:
+        """Picklable kwargs to reconstruct this Synthesizer in a worker process.
+
+        The model itself is not picklable, so parallel workers rebuild a fresh
+        Synthesizer from this config. The fields exactly mirror those folded into
+        cache_key(), so a worker writes cache files the parent will recognize.
+        """
+        return {
+            "emotion": self._emotion,
+            "voice_id": self._voice_id,
+            "ref_audio": self._ref_audio,
+            "ref_text": self._ref_text,
+            "quiet": self._quiet,
+        }
+
     def synth(self, text: str, out_path: Path) -> AudioSegment:
-        """Synthesize `text` to a 24 kHz wav and return it as an AudioSegment."""
+        """Synthesize `text` to a 48 kHz wav and return it as an AudioSegment."""
         tts = self._engine()
         with _suppress_native_stderr(self._quiet):
             if self._voice_data is not None:
-                audio = tts.infer(text=text, voice=self._voice_data)
+                audio = tts.infer(text=text, voice=self._voice_data, emotion=self._emotion)
             elif self._ref_audio:
-                audio = tts.infer(text=text, ref_audio=self._ref_audio, ref_text=self._ref_text)
+                audio = tts.infer(text=text, ref_audio=self._ref_audio,
+                                  ref_text=self._ref_text, emotion=self._emotion)
             else:
-                audio = tts.infer(text=text)
+                audio = tts.infer(text=text, emotion=self._emotion)
             tts.save(audio, str(out_path))
         return AudioSegment.from_wav(out_path)
 
@@ -268,28 +286,60 @@ def _time_stretch(clip: AudioSegment, factor: float) -> AudioSegment:
         return AudioSegment.from_wav(dst)
 
 
+def _fit_factor(dur_ms: float, slot_ms: int, max_speed: float) -> float:
+    """Tempo factor needed to fit `dur_ms` into `slot_ms`, capped at max_speed.
+
+    Returns 1.0 (no change) when the clip already fits or the slot is unknown.
+    """
+    if slot_ms <= 0 or dur_ms <= slot_ms:
+        return 1.0
+    return min(dur_ms / slot_ms, max_speed)
+
+
 def fit_to_slot(clip: AudioSegment, slot_ms: int, max_speed: float) -> AudioSegment:
     """Speed up `clip` (pitch-preserving) so it fits `slot_ms`, capped at max_speed.
 
     If the required factor exceeds the cap, the clip is sped to the cap only and
     the remainder is allowed to overflow into the following gap.
     """
-    dur = len(clip)
-    if slot_ms <= 0 or dur <= slot_ms:
+    factor = _fit_factor(len(clip), slot_ms, max_speed)
+    if abs(factor - 1.0) < 1e-3:
         return clip
-    return _time_stretch(clip, min(dur / slot_ms, max_speed))
+    return _time_stretch(clip, factor)
 
 
 def assemble_track(
     placements: List[tuple[int, AudioSegment]],
     floor_ms: int = 0,
 ) -> AudioSegment:
-    """Overlay each (start_ms, clip) onto a silent base of sufficient length."""
+    """Place each (start_ms, clip) onto a silent base of sufficient length.
+
+    Sums all clips into one preallocated buffer instead of chaining pydub's
+    overlay(): overlay() copies the entire (multi-hundred-MB) base each call, so
+    chaining N clips is O(N * base_len). Here we write each clip once into a
+    shared int32 accumulator, then saturate to int16 — matching overlay's
+    clipping behaviour on the rare overlap, at a fraction of the cost.
+    """
     total = max([floor_ms] + [start + len(clip) for start, clip in placements]) + 500
     base = AudioSegment.silent(duration=total, frame_rate=VIENEU_SAMPLE_RATE)
+    if not placements:
+        return base
+
+    import numpy as np
+
+    rate, channels, width = base.frame_rate, base.channels, base.sample_width
+    acc = np.zeros(len(base.get_array_of_samples()), dtype=np.int32)
     for start_ms, clip in placements:
-        base = base.overlay(clip, position=start_ms)
-    return base
+        # Match the base's format so samples line up frame-for-frame.
+        clip = clip.set_frame_rate(rate).set_channels(channels).set_sample_width(width)
+        samples = np.frombuffer(clip.raw_data, dtype=np.int16).astype(np.int32)
+        pos = int(start_ms * rate / 1000) * channels
+        end = min(pos + samples.shape[0], acc.shape[0])
+        acc[pos:end] += samples[: end - pos]
+
+    limit = 1 << (8 * width - 1)
+    np.clip(acc, -limit, limit - 1, out=acc)
+    return base._spawn(acc.astype(np.int16).tobytes())
 
 
 # --------------------------------------------------------------------------- #
@@ -392,11 +442,13 @@ def render_narration(
     if cache_dir:
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Warm up the model once (cleanly) only if at least one cue needs synthesis.
-    def _cached_path(cue: Cue) -> Optional[Path]:
-        return cache_dir / f"{synth.cache_key(cue.text)}.wav" if cache_dir else None
-
-    needs_synth = any(not (cp and cp.exists()) for cp in (_cached_path(c) for c in cues))
+    # Resolve each cue's cache path once (the key is a sha1, recomputing it per
+    # cue twice would be wasteful), then warm up the model only if something is
+    # actually missing from the cache.
+    cached_paths: List[Optional[Path]] = [
+        cache_dir / f"{synth.cache_key(c.text)}.wav" if cache_dir else None for c in cues
+    ]
+    needs_synth = any(not (cp and cp.exists()) for cp in cached_paths)
     if needs_synth:
         if show_progress:
             print("  loading VieNeu model (first run downloads it)…", flush=True)
@@ -418,7 +470,7 @@ def render_narration(
             continue
 
         raw_path = work_dir / f"cue_{cue.index}.wav"
-        cached = cache_dir / f"{synth.cache_key(cue.text)}.wav" if cache_dir else None
+        cached = cached_paths[i]
         if cached and cached.exists():
             clip = AudioSegment.from_wav(cached)
             n_cache += 1
@@ -434,9 +486,13 @@ def render_narration(
                 clip.export(cached, format="wav")
             n_synth += 1
 
-        if speed != 1.0:
-            clip = _time_stretch(clip, speed)  # global pitch-preserving speed-up
-        clip = fit_to_slot(clip, slot_ms, max_speed)
+        # Combine the global `speed` and the slot-fit into a single tempo factor so
+        # each clip is stretched at most once (each stretch is a separate ffmpeg
+        # call). The cap still applies only to the fit portion, as before: global
+        # speed first, then fit the resulting duration into the slot.
+        factor = speed * _fit_factor(len(clip) / speed, slot_ms, max_speed)
+        if abs(factor - 1.0) >= 1e-3:
+            clip = _time_stretch(clip, factor)
         placements.append((cue.start_ms, clip))
 
         if show_progress:
@@ -461,6 +517,136 @@ def render_narration(
 
 
 # --------------------------------------------------------------------------- #
+# Parallel cache pre-fill
+# --------------------------------------------------------------------------- #
+def _progress_bar(done: int, total: int, start_t: float, *, label: str = "", width: int = 26) -> None:
+    """Render an in-place '[####----] d/t (p%) elapsed/eta' slider to stdout.
+
+    ETA is a linear extrapolation from the average time per completed item, so it
+    settles once a few items are done. Caller is responsible for the trailing
+    newline when finished.
+    """
+    frac = (done / total) if total else 1.0
+    filled = int(round(width * frac))
+    bar = "█" * filled + "░" * (width - filled)
+    elapsed = time.monotonic() - start_t
+    eta = (elapsed / done) * (total - done) if done else 0.0
+    head = f"{label} " if label else ""
+    sys.stdout.write(
+        f"\r  {head}[{bar}] {done}/{total} ({100 * frac:4.1f}%)  "
+        f"elapsed {_fmt_secs(elapsed)}  eta {_fmt_secs(eta)}   "
+    )
+    sys.stdout.flush()
+
+
+# Per-worker model, loaded once by the pool initializer and reused across every
+# task that worker handles (re-loading per cue would dwarf the synthesis cost).
+_WORKER_SYNTH: Optional["Synthesizer"] = None
+
+
+def _worker_init(config: dict, omp_threads: int) -> None:
+    """ProcessPool initializer: cap CPU threads, then load this worker's model once."""
+    if omp_threads:
+        # Cap each worker to its share of cores. Must be set BEFORE the TTS backend
+        # (onnxruntime / torch) initializes, else N workers each grab every core and
+        # thrash. Safe here because vieneu is imported lazily inside Synthesizer.
+        for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ[var] = str(omp_threads)
+    global _WORKER_SYNTH
+    _WORKER_SYNTH = Synthesizer(**config)
+    _WORKER_SYNTH.load()  # eager, so the model-load cost lands here, not in task #1
+
+
+def _synth_one(task: tuple) -> bool:
+    """Synthesize one (cache_key, text) into cache_dir/<key>.wav. Returns success.
+
+    A failure on one cue is swallowed (so a single bad cue can't break the pool) —
+    render_narration retries any gap left behind.
+    """
+    key, text, cache_dir_str = task
+    out = Path(cache_dir_str) / f"{key}.wav"
+    if out.exists():
+        return True
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = _WORKER_SYNTH.synth(text, Path(tmp) / "w.wav")  # type: ignore[union-attr]
+            clip.export(out, format="wav")
+        return True
+    except Exception:
+        return False
+
+
+def prefill_cache_parallel(
+    cues: List[Cue],
+    synth: "Synthesizer",
+    *,
+    cache_dir: Path,
+    workers: int,
+    show_progress: bool = True,
+) -> int:
+    """Synthesize missing cues into `cache_dir` using `workers` processes.
+
+    Cue synthesis is embarrassingly parallel (each cue is an independent TTS
+    call), so this pre-fills the per-cue cache across several processes — each
+    with its own model — before the sequential render_narration pass, which then
+    finds everything cached and only does the cheap fit/assemble work. This is
+    what speeds up a SINGLE long file, where file-level parallelism can't help.
+
+    Each cue is submitted as its own task and drained via as_completed, so a live
+    progress bar with ETA can advance per cue (the model is loaded once per worker
+    in the initializer, not per task). Returns the number synthesized OK. No-op
+    (returns 0) when workers <= 1 or nothing is missing; render_narration then
+    synthesizes serially as before.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Collect unique, speakable, not-yet-cached cues. Dedupe by cache key so the
+    # same line (common after --merge-gap) isn't synthesized twice.
+    seen: set[str] = set()
+    items: List[tuple[str, str]] = []
+    for c in cues:
+        if not any(ch.isalnum() for ch in c.text):
+            continue
+        key = synth.cache_key(c.text)
+        if key in seen or (cache_dir / f"{key}.wav").exists():
+            continue
+        seen.add(key)
+        items.append((key, c.text))
+
+    workers = max(1, min(workers, len(items)))
+    if workers <= 1:
+        return 0
+
+    omp = max(1, (os.cpu_count() or workers) // workers)
+    config = synth.config()
+    tasks = [(key, text, str(cache_dir)) for key, text in items]
+    total = len(tasks)
+
+    if show_progress:
+        print(f"  prefill: {total} cue(s) across {workers} worker(s) "
+              f"({omp} thread(s) each); loading models…", flush=True)
+    start = time.monotonic()
+    done = ok = 0
+    with ProcessPoolExecutor(
+        max_workers=workers, initializer=_worker_init, initargs=(config, omp)
+    ) as ex:
+        futures = [ex.submit(_synth_one, t) for t in tasks]
+        for fut in as_completed(futures):
+            ok += bool(fut.result())
+            done += 1
+            if show_progress:
+                _progress_bar(done, total, start, label="prefill")
+    if show_progress:
+        sys.stdout.write("\n")
+        miss = total - ok
+        note = f" ({miss} deferred to serial pass)" if miss else ""
+        print(f"  prefill done: {ok}/{total} in {_fmt_secs(time.monotonic() - start)}{note}",
+              flush=True)
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
 def build_voiceover(args: argparse.Namespace) -> None:
@@ -478,14 +664,20 @@ def build_voiceover(args: argparse.Namespace) -> None:
         ref_text=args.clone_text,
     )
 
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    if getattr(args, "workers", 1) > 1 and not cache_dir:
+        sys.exit("--workers > 1 requires --cache-dir (workers share results via the cache).")
+
     with tempfile.TemporaryDirectory() as tmp:
         floor = probe_duration_ms(Path(args.video)) if args.video else 0
+        if cache_dir and getattr(args, "workers", 1) > 1:
+            prefill_cache_parallel(cues, synth, cache_dir=cache_dir, workers=args.workers)
         track = render_narration(
             cues, synth,
             max_speed=args.max_speed,
             floor_ms=floor,
             work_dir=Path(tmp),
-            cache_dir=Path(args.cache_dir) if args.cache_dir else None,
+            cache_dir=cache_dir,
             speed=args.speed,
         )
 
@@ -520,13 +712,16 @@ def main() -> None:
                    help="Max pitch-preserving speed-up to fit a slot (default 1.5)")
     p.add_argument("--speed", type=float, default=1.0,
                    help="Global pitch-preserving narration speed (1.1-1.25 transparent)")
-    p.add_argument("--voice", help="Preset voice id, e.g. 'Doan' or 'Vinh'")
+    p.add_argument("--voice", help="Preset voice id, e.g. 'Ngọc Linh' or 'Trọng Hữu'")
     p.add_argument("--emotion", default="natural",
                    help="Voice emotion: 'natural' or 'storytelling' (default natural)")
     p.add_argument("--merge-gap", type=int, default=0,
                    help="Merge cues with gaps <= this (ms) to cut TTS calls (default 0=off)")
     p.add_argument("--cache-dir",
                    help="Directory to cache per-cue synthesis for fast re-runs")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Parallel TTS worker processes to pre-synthesize cues "
+                        "(needs --cache-dir; default 1). Speeds up a single long file.")
     p.add_argument("--clone-audio", help="3-5s reference .wav to clone narrator voice")
     p.add_argument("--clone-text", help="Exact transcript of the reference clip")
     build_voiceover(p.parse_args())
