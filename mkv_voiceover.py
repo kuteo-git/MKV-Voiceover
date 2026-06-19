@@ -378,7 +378,11 @@ def add_narration_track(
             f"{tail}"
         )
 
-    maps: list[str] = ["-map", "0:v"]
+    # 0:V (uppercase) = real video only, EXCLUDING attached pictures (cover art).
+    # A cover-art mjpeg stream has a single packet that never advances, so with
+    # -max_interleave_delta 0 ffmpeg would buffer the whole file in RAM waiting for
+    # it — OOM/SIGKILL on long high-bitrate remuxes. Dropping it avoids that.
+    maps: list[str] = ["-map", "0:V"]
     for i in keep:
         maps += ["-map", f"0:a:{i}"]
     maps += ["-map", "0:s?", "-map", "0:t?", "-map", "[na]"]
